@@ -1,0 +1,277 @@
+---
+title:
+author: "Rhema Francis"
+date: "2026-07-02"
+output: html_document
+---
+# RNA-Seq Pipeline for Differential Expression Analysis
+
+## Package Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r install, eval=FALSE}
+install.packages("BiocManager")
+BiocManager::install(c("GEOquery", "DESeq2"), ask = FALSE, update = FALSE)
+install.packages(c("ggplot2", "dplyr", "knitr"))
+```
+
+```{r library, message=FALSE, warning=FALSE}
+library(GEOquery)
+library(DESeq2)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+```
+
+## 1. Introduction 
+The R Markdown contains the code to walk through an end-to end gene-level RNA-seq  differential expression analysis using Bioconductor packages. This workflow begins with a pre-processed gene-level count matrix obtained from GEO and proceeds through downstream differential expression analysis. Differential expression analysis will be performed via t-test, before and after Benjamini-Hochberg correction, and then via DESeq2 analysis. 
+
+### 1.1 Biomarker Dataset
+The GEO dataset used in this workflow is GSE184717, obtained from a rapid-autopsy study of metastatic breast cancer (Huang et al., 2021, Genome Medicine). Unlike many case-control gene expression studies that include samples from many different patients, this dataset contains 42 samples collected from a single patient with triple-negative metastatic breast cancer. The dataset includes 28 gross tumor biopsies and 14 adjacent normal tissue samples, obtained via rapid-autopsy across multiple organs.The implications of this study design are discussed further in section 1.4. 
+
+### 1.2 Research Question 
+The goal of this study is to identify genes that are differentially expressed between metastatic breast tumor biopsies and adjacent normal tissue within this patient. More specifically, this study investigates the gene expression changes associated with metastatic colonization in triple-negative breast cancer. Since all the samples originate from a single patient, the findings could help identify dysregulated genes across multiple independent metastatic sites, and highlight pathways relevant to metastatic disease progression and potential therapeutic agents (Huang et al., 2021, Genome Medicine). 
+
+### 1.3 Study Design
+The dataset comes from a rapid-autopsy of a 45-year old patient with triple-negative breast cancer. Tissue samples were collected from multiple organs approximately two hours after death and consisted of 28 metastatic tumor samples and 14 adjacent normal tissue samples (Huang et al., 2021, Genome Medicine). 
+
+### 1.4 Biological and Technical Replicates
+No technical replicates were reported for this dataset because each of the 42 samples represents a distinct tissue biopsy (Huang et al., 2021, Genome Medicine). However, since the samples were collected from a single patient, the samples can't be considered as biological replicates in the "traditional" sense. Instead, the 28 tumor and 14 normal samples are spatial pseudoreplicates, because of the repeated sampling of the same subject at different sites (Zimmerman et al., 2021). Any samples found differentially expressed should therefore be interpreted as potential markers for this patient only, rather than biomarkers for breast cancer as a whole, until validated in larger, independent cohorts.
+
+### 1.5 Statistical Power
+Typically, a dataset with 28 tumor and 14 normal samples would have good statistical power to indentify differentially expressed genes. However, since all the samples came from a single patient, the ability to make generalizations is limited (Heumos et al., 2023). The study has strong power to characterize this specific patient's metastatic gene expression, but limited power to make general conclusions about breast cancer in other patients. 
+
+## 2. Data Acquistion and Preprocessing
+GEO stores the count matrix and sample metadata in separate files, so they were downloaded independently and matched using their sample IDs.
+
+#### 2.1 Download and load sample metadata
+
+```{r}
+# Download series matrix, only has sample metadata, not expression data
+gse <- getGEO("GSE184717", GSEMatrix = TRUE)
+eset <- gse[[1]]
+
+# Extract phenotype/sample metadata
+pheno <- pData(eset)
+
+sample_info <- pheno[, c("title", "source_name_ch1", "tissue:ch1", "cell type:ch1")]
+colnames(sample_info) <- c("title", "source_name", "tissue_site", "cell_type")
+
+# Check dimensions
+dim(sample_info)
+head(sample_info)
+```
+
+### 2.2 Download and Load Count Matrix
+```{r load-data, cache=TRUE}
+
+options(timeout = 300)
+
+getGEOSuppFiles("GSE184717", baseDir = "data", makeDirectory = TRUE)
+
+count_file <- list.files(
+  "data/GSE184717",
+  pattern = "featureCountMatrix",
+  full.names = TRUE
+)
+
+# Read the count matrix
+counts <- read.table(
+  gzfile(count_file),
+  header = TRUE,
+  row.names = 1,
+  check.names = FALSE
+)
+
+# Check dimensions
+dim(counts)
+head(counts[, 1:5])
+colnames(counts)
+```
+
+### 2.3 Align Sample Metadata to Count Matrix
+
+```{r}
+sample_info <- sample_info[match(colnames(counts), sample_info$title), ]
+
+all(sample_info$title == colnames(counts))
+
+rownames(sample_info) <- sample_info$title
+
+sample_info$cell_type <- factor(sample_info$cell_type, levels = c("normal", "cancer"))
+
+table(sample_info$cell_type)
+table(sample_info$tissue_site)
+```
+
+### 2.4 Remove low count genes
+
+```{r}
+keep_genes <- rowSums(counts) >= 10
+
+counts_filtered <- counts[keep_genes, ]
+
+dim(counts_filtered)
+```
+
+## 3. QC Exploratory Data Analysis
+### 3.1 Build DESeq2 dataframe for PCA
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData = sample_info,
+  design = ~ cell_type
+)
+
+dds
+```
+
+### 3.2 Transform raw count data to stabilize variance for QC
+```{r}
+vsd <- vst(dds, blind = TRUE)
+```
+
+### 3.3 Extract PCA Data
+```{r}
+pca_df <- plotPCA(vsd, intgroup = c("cell_type", "tissue_site"), returnData = TRUE)
+
+percentVar <- round(100 * attr(pca_df, "percentVar"))
+```
+
+#### 3.4 PCA Plot
+```{r}
+ggplot(pca_df, aes(PC1, PC2, color = cell_type, shape = tissue_site)) + geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal() +
+  ggtitle("PCA Plot of Samples by Cell Type and Tissue Site")
+```
+
+PC1 explained 60% of the total variance and mostly separated the tumor and normal samples into distinct clusters.
+
+Some overlap remained, with a few tumor samples clustered near the normal samples, and one lung-derived normal sample clustered near the cancer samples. One exception was a single kidney-derived normal sample that separated from all the other samples along PC2 (16% variance).  
+The PCA plot confirms that tumor status is the biggest source of variation, with tissue origin contributing slightly to the variation in samples, and in one case, has a greater influence. This supports treating the samples as pseudoreplicates instead of independent biological replicates. 
+
+##  4. Differential Expression Analysis
+
+### 4.1 DESeq2 Analysis
+
+#### 4.1.1 Run DESeq2
+
+```{r}
+dds <- DESeq(dds)
+```
+
+#### 4.1.2 Extract Results
+
+```{r}
+results_deseq <- results(dds)
+
+summary(results_deseq)
+
+head(results_deseq)
+
+# Number or significant results at padj < 0.05
+sum(results_deseq$padj < 0.05, na.rm = TRUE)
+```
+
+### 4.2 Differential Expression using a T-test
+The t-test used the DESeq2-normalized counts so that both methods were compared using the same normalized data. 
+
+#### 4.2.1 Pull normalized counts from dds
+
+```{r}
+norm_counts <- counts(dds, normalized = TRUE)
+
+dim(norm_counts)
+head(norm_counts[, 1:5])
+```
+
+#### 4.2.2 Log2 Transform
+
+```{r}
+log_norm_counts <- log2(norm_counts + 1)
+
+dim(log_norm_counts)
+head(log_norm_counts[, 1:5])
+```
+
+#### 4.2.3 T-test before correction
+
+```{r}
+group <- sample_info$cell_type
+
+ttest_pvalues <- apply(log_norm_counts, 1, function(x) {t.test(x[group == "cancer"], x[group == "normal"])$p.value})
+
+length(ttest_pvalues)
+head(ttest_pvalues)
+```
+
+#### 4.2.4 Count significant genes before correction
+
+```{r}
+sig_before <- sum(ttest_pvalues < 0.05, na.rm = TRUE)
+
+cat("Significant Genes before correction:", sig_before)
+```
+
+#### 4.2.5 Apply B-H Correction
+
+```{r}
+ttest_padj <- p.adjust(ttest_pvalues, method = "BH")
+```
+
+#### 4.2.6 Significant genes after BH correction
+
+```{r}
+sig_after <- sum(ttest_padj < 0.05, na.rm = TRUE)
+
+cat("Significant genes after BH correction:", sig_after)
+```
+
+The t-test initially identified 15,205 significant before multiple testing correction (p-value < 0.05). After Benjamini-Hochberg correction, 14,434 genes remained significant.
+
+Compared to many RNA-seq differential expression studies, the decrease after B-H correction was relatively small (Conesa et al., 2016). The small change is probably because most of the p-values were already small. This likely ties back to the study design, since all samples came from a single patient. There was less natural variation than would be expected in a multi-patient study, which makes it easier to detect significant differences between tumor and normal tissue.
+
+### 4.3 Compare BH adjusted t-test and DESeq2
+
+To compare the B-H adjusted t-test and DESeq2, the overlap in significant genes between the two methods was calculated.
+
+```{r}
+# Post-BH t-test significant genes
+ttest_sig_genes <- names(ttest_padj)[ttest_padj < 0.05]
+
+length(ttest_sig_genes)
+
+#  DESeq2 Genes significant genes
+deseq_sig_genes <- rownames(results_deseq)[!is.na(results_deseq$padj) & results_deseq$padj < 0.05]
+
+length(deseq_sig_genes)
+
+# Overlap between the two methods
+overlap <- intersect(ttest_sig_genes, deseq_sig_genes)
+
+length(overlap)
+```
+
+DESeq2 identified 14,829 significant genes (padj < 0.05), compared with 14,434 identified by the post-BH t-test. 
+
+The two gene lists overlapped by 13,453 significant genes identified by both methods which shows a strong agreement between the two. The t-test was performed on log-transformed, DESeq2-normalized data, while DESeq2 used used a negative binomial linear model on raw normalized counts. 
+
+Each method also identified a small amount of genes that the other didn't. The t-test identified 981 genes, and DESeq2 identified 1,376. This is consistent with the way DESeq2's analyzes RNA-seq data; by using dispersion-shrinkage to share information across genes to estimate variability. It can detect some genes that a t-test may overlook (Love et al., 2014). 
+
+## 5. Summary and Conclusions
+
+This workflow successfully compared two differential expression analyses on a single-patient rapid-autopsy dataset and found strong agreement between the results. However, the single-patient design means these findings are specific to this individual and cannot be generalized to all breast cancer patients without validation in independent cohorts.
+
+## References:
+Conesa, A., Madrigal, P., Tarazona, S., Gomez-Cabrero, D., Cervera, A., McPherson, A., Szcześniak, M. W., Gaffney, D. J., Elo, L. L., Zhang, X., & Mortazavi, A. (2016). A survey of best practices for RNA-seq data analysis. Genome biology, 17, 13. https://doi.org/10.1186/s13059-016-0881-8
+
+Heumos, L., Schaar, A. C., Lance, C., Litinetskaya, A., Drost, F., Zappia, L., Lücken, M. D., Strobl, D. C., Henao, J., Curion, F., Schiller, H. B., & Theis, F. J. (2023). Best practices for single-cell analysis across modalities. Nature Reviews Genetics, 24(8), 1–23. https://doi.org/10.1038/s41576-023-00586-w
+
+Huang, X., Qiao, Y., Brady, S. W., Factor, R. E., Downs-Kelly, E., Farrell, A., McQuerry, J. A., Shrestha, G., Jenkins, D., Johnson, W. E., Cohen, A. L., Bild, A. H., & Marth, G. T. (2021). Novel temporal and spatial patterns of metastatic colonization from breast cancer rapid-autopsy tumor biopsies. Genome Medicine, 13(1), 170. https://doi.org/10.1186/s13073-021-00989-6
+
+Love, M. I., Huber, W., & Anders, S. (2014). Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. Genome biology, 15(12), 550. https://doi.org/10.1186/s13059-014-0550-8
+
