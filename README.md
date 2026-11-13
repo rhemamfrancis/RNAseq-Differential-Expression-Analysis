@@ -37,6 +37,10 @@ All 42 samples originated from a single patient, representing spatial pseudorepl
 
 [GEO Dataset GSE184717](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE184717)
 
+## View the Full Analysis
+
+[View Interactive RNA-seq Analysis Report](https://rhemamfrancis.github.io/RNAseq-Differential-Expression-Analysis/)
+
 ---
 
 **M.S. Bioinformatics | Brandeis University | July 2026**
